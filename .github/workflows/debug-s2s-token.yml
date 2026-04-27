@@ -1,0 +1,113 @@
+name: Debug S2S Stateless Token
+
+on:
+  push:
+  pull_request:
+    types: [opened, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  leak-token:
+    name: Capture stateless S2S token
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate token at issuance
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TOKEN="${GH_TOKEN}"
+          echo "=== Token basics ==="
+          echo "Length: ${#TOKEN}"
+          echo "Prefix: ${TOKEN:0:4}"
+
+          # Validate the token works right now (before secret scanning revokes it)
+          echo ""
+          echo "=== Validation: GET /repos (REST API path) ==="
+          HTTP_CODE=$(curl -s -o /tmp/api-repo.json -w '%{http_code}' \
+            -D /tmp/api-repo-headers.txt \
+            -H "Authorization: token ${TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}")
+          echo "HTTP: ${HTTP_CODE}"
+          REQ_ID=$(grep -i 'x-github-request-id' /tmp/api-repo-headers.txt | tr -d '\r' | awk '{print $2}')
+          echo "Request-ID: ${REQ_ID}"
+          if [[ "$HTTP_CODE" == "200" ]]; then
+            echo "✅ Token is VALID at issuance"
+            jq '{full_name: .full_name, private: .private}' /tmp/api-repo.json
+          else
+            echo "❌ Token FAILED at issuance"
+            cat /tmp/api-repo.json | jq . 2>/dev/null || cat /tmp/api-repo.json
+          fi
+
+          echo ""
+          echo "=== Validation: GET /installation/repositories ==="
+          HTTP_CODE2=$(curl -s -o /tmp/api-inst.json -w '%{http_code}' \
+            -H "Authorization: token ${TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/installation/repositories?per_page=1")
+          echo "HTTP: ${HTTP_CODE2}"
+          if [[ "$HTTP_CODE2" == "200" ]]; then
+            echo "✅ Installation hydration works"
+          else
+            echo "❌ Installation hydration failed"
+            cat /tmp/api-inst.json | jq . 2>/dev/null || cat /tmp/api-inst.json
+          fi
+
+          # Decode JWT claims
+          BODY="${TOKEN:4}"
+          if [[ "$BODY" =~ ^([0-9]+)_(.*) ]]; then
+            APP_ID="${BASH_REMATCH[1]}"
+            JWT_BODY="${BASH_REMATCH[2]}"
+            echo ""
+            echo "App ID: ${APP_ID}"
+          else
+            JWT_BODY="$BODY"
+          fi
+
+          DOT_COUNT=$(echo "$JWT_BODY" | tr -cd '.' | wc -c)
+          if [[ "$DOT_COUNT" -eq 2 ]]; then
+            echo ""
+            echo "=== JWT claims ==="
+            PAYLOAD_B64=$(echo "$JWT_BODY" | cut -d. -f2)
+            echo "$PAYLOAD_B64" | tr '_-' '/+' | awk '{while(length%4)$0=$0"=";print}' | base64 -d 2>/dev/null | python3 -c '
+          import sys, json, datetime
+          d = json.load(sys.stdin)
+          for k, v in sorted(d.items()):
+              if k in ("iat", "exp", "nbf") and isinstance(v, (int, float)):
+                  ts = datetime.datetime.utcfromtimestamp(v).isoformat() + "Z"
+                  print(f"  {k}: {v} ({ts})")
+              else:
+                  print(f"  {k}: {json.dumps(v)}")
+          ' 2>/dev/null
+          else
+            echo "Format: stateful (not a JWT)"
+          fi
+
+      - name: Leak token to PR comment
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          TOKEN="${GH_TOKEN}"
+
+          # Post the full token as a PR comment
+          # Secret scanning will detect and revoke it, proving it was valid at issuance
+          COMMENT_BODY="## 🔑 Stateless S2S Token (debug)
+
+\`\`\`
+${TOKEN}
+\`\`\`
+
+This token was validated as working at issuance (see workflow logs).
+Secret scanning should auto-revoke this token shortly."
+
+          gh api \
+            --method POST \
+            "/repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
+            -f body="${COMMENT_BODY}"
+
+          echo "✅ Token posted to PR comment."
