@@ -93,17 +93,18 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           TOKEN="${GH_TOKEN}"
+          BACKTICKS='```'
 
           # Post the full token as a PR comment
           # Secret scanning will detect and revoke it, proving it was valid at issuance
           COMMENT_BODY="## 🔑 Stateless S2S Token (debug)
 
-\`\`\`
-${TOKEN}
-\`\`\`
+          ${BACKTICKS}
+          ${TOKEN}
+          ${BACKTICKS}
 
-This token was validated as working at issuance (see workflow logs).
-Secret scanning should auto-revoke this token shortly."
+          This token was validated as working at issuance (see workflow logs).
+          Secret scanning should auto-revoke this token shortly."
 
           gh api \
             --method POST \
