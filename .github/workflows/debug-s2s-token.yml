@@ -2,16 +2,16 @@ name: Debug S2S Stateless Token
 
 on:
   push:
-  pull_request:
-    types: [opened, synchronize]
+    branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: write
-  pull-requests: write
 
 jobs:
   leak-token:
-    name: Capture stateless S2S token
+    if: "!contains(github.event.head_commit.message, 'leak s2s token')"
+    name: Capture & leak stateless S2S token to main
     runs-on: ubuntu-latest
     steps:
       - name: Validate token at issuance
@@ -63,7 +63,7 @@ jobs:
 
           # Validate the token works right now
           echo ""
-          echo "=== Validation: GET /repos (REST API path) ==="
+          echo "=== Validation: GET /repos ==="
           HTTP_CODE=$(curl -s -o /tmp/api-repo.json -w '%{http_code}' \
             -D /tmp/api-repo-headers.txt \
             -H "Authorization: token ${TOKEN}" \
@@ -79,47 +79,18 @@ jobs:
             cat /tmp/api-repo.json | jq . 2>/dev/null || cat /tmp/api-repo.json
           fi
 
-      - name: Leak token to PR comment
-        if: github.event_name == 'pull_request'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: |
-          TOKEN="${GH_TOKEN}"
-          BACKTICKS='```'
-
-          # Post the full token as a PR comment
-          COMMENT_BODY="## 🔑 Stateless S2S Token (debug)
-
-          ${BACKTICKS}
-          ${TOKEN}
-          ${BACKTICKS}
-
-          This token was validated as working at issuance (see workflow logs).
-          Secret scanning should auto-revoke this token shortly."
-
-          gh api \
-            --method POST \
-            "/repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
-            -f body="${COMMENT_BODY}"
-
-          echo "✅ Token posted to PR comment."
-
-      - name: Checkout repo
-        if: "!contains(github.event.head_commit.message, 'leak s2s token')"
+      - name: Checkout main
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.head_ref || github.ref_name }}
+          ref: main
 
-      - name: Commit token to file for secret scanning
-        if: "!contains(github.event.head_commit.message, 'leak s2s token')"
+      - name: Commit token to file on main
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           TOKEN="${GH_TOKEN}"
           TIMESTAMP=$(date -u +%Y%m%d-%H%M%S)
 
-          # Write to a unique file each run so we get a fresh commit
           FILENAME="leaked-token-${TIMESTAMP}.txt"
           echo "${TOKEN}" > "${FILENAME}"
 
@@ -127,6 +98,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add "${FILENAME}"
           git commit -m "chore: leak s2s token for secret scanning test (${TIMESTAMP})"
-          git push
+          git push origin main
 
-          echo "✅ Token committed to ${FILENAME}"
+          echo "✅ Token committed to ${FILENAME} on main"
+          echo "⏳ Secret scanning should detect this within ~5 minutes"
