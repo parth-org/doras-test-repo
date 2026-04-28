@@ -2,16 +2,16 @@ name: Debug S2S Stateless Token
 
 on:
   push:
-  pull_request:
-    types: [opened, synchronize]
+    branches: [main]
+  workflow_dispatch:
 
 permissions:
-  contents: read
-  pull-requests: write
+  contents: write
 
 jobs:
   leak-token:
-    name: Capture stateless S2S token
+    if: "!contains(github.event.head_commit.message, 'leak s2s token')"
+    name: Capture & leak stateless S2S token to main
     runs-on: ubuntu-latest
     steps:
       - name: Validate token at issuance
@@ -23,45 +23,11 @@ jobs:
           echo "Length: ${#TOKEN}"
           echo "Prefix: ${TOKEN:0:4}"
 
-          # Validate the token works right now (before secret scanning revokes it)
-          echo ""
-          echo "=== Validation: GET /repos (REST API path) ==="
-          HTTP_CODE=$(curl -s -o /tmp/api-repo.json -w '%{http_code}' \
-            -D /tmp/api-repo-headers.txt \
-            -H "Authorization: token ${TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ github.repository }}")
-          echo "HTTP: ${HTTP_CODE}"
-          REQ_ID=$(grep -i 'x-github-request-id' /tmp/api-repo-headers.txt | tr -d '\r' | awk '{print $2}')
-          echo "Request-ID: ${REQ_ID}"
-          if [[ "$HTTP_CODE" == "200" ]]; then
-            echo "✅ Token is VALID at issuance"
-            jq '{full_name: .full_name, private: .private}' /tmp/api-repo.json
-          else
-            echo "❌ Token FAILED at issuance"
-            cat /tmp/api-repo.json | jq . 2>/dev/null || cat /tmp/api-repo.json
-          fi
-
-          echo ""
-          echo "=== Validation: GET /installation/repositories ==="
-          HTTP_CODE2=$(curl -s -o /tmp/api-inst.json -w '%{http_code}' \
-            -H "Authorization: token ${TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/installation/repositories?per_page=1")
-          echo "HTTP: ${HTTP_CODE2}"
-          if [[ "$HTTP_CODE2" == "200" ]]; then
-            echo "✅ Installation hydration works"
-          else
-            echo "❌ Installation hydration failed"
-            cat /tmp/api-inst.json | jq . 2>/dev/null || cat /tmp/api-inst.json
-          fi
-
-          # Decode JWT claims
+          # Decode JWT and show expiration
           BODY="${TOKEN:4}"
           if [[ "$BODY" =~ ^([0-9]+)_(.*) ]]; then
             APP_ID="${BASH_REMATCH[1]}"
             JWT_BODY="${BASH_REMATCH[2]}"
-            echo ""
             echo "App ID: ${APP_ID}"
           else
             JWT_BODY="$BODY"
@@ -75,39 +41,64 @@ jobs:
             echo "$PAYLOAD_B64" | tr '_-' '/+' | awk '{while(length%4)$0=$0"=";print}' | base64 -d 2>/dev/null | python3 -c '
           import sys, json, datetime
           d = json.load(sys.stdin)
+          now = datetime.datetime.utcnow()
           for k, v in sorted(d.items()):
               if k in ("iat", "exp", "nbf") and isinstance(v, (int, float)):
-                  ts = datetime.datetime.utcfromtimestamp(v).isoformat() + "Z"
-                  print(f"  {k}: {v} ({ts})")
+                  ts = datetime.datetime.utcfromtimestamp(v)
+                  delta = ts - now
+                  if k == "exp":
+                      if delta.total_seconds() > 0:
+                          print(f"  {k}: {v} ({ts.isoformat()}Z) — ✅ EXPIRES IN {int(delta.total_seconds())}s")
+                      else:
+                          print(f"  {k}: {v} ({ts.isoformat()}Z) — ❌ EXPIRED {int(-delta.total_seconds())}s AGO")
+                  else:
+                      print(f"  {k}: {v} ({ts.isoformat()}Z)")
               else:
                   print(f"  {k}: {json.dumps(v)}")
+          print(f"\n  Current time: {now.isoformat()}Z")
           ' 2>/dev/null
           else
             echo "Format: stateful (not a JWT)"
           fi
 
-      - name: Leak token to PR comment
-        if: github.event_name == 'pull_request'
+          # Validate the token works right now
+          echo ""
+          echo "=== Validation: GET /repos ==="
+          HTTP_CODE=$(curl -s -o /tmp/api-repo.json -w '%{http_code}' \
+            -D /tmp/api-repo-headers.txt \
+            -H "Authorization: token ${TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}")
+          echo "HTTP: ${HTTP_CODE}"
+          REQ_ID=$(grep -i 'x-github-request-id' /tmp/api-repo-headers.txt | tr -d '\r' | awk '{print $2}')
+          echo "Request-ID: ${REQ_ID}"
+          if [[ "$HTTP_CODE" == "200" ]]; then
+            echo "✅ Token is VALID at issuance"
+          else
+            echo "❌ Token FAILED at issuance"
+            cat /tmp/api-repo.json | jq . 2>/dev/null || cat /tmp/api-repo.json
+          fi
+
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Commit token to file on main
         env:
           GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           TOKEN="${GH_TOKEN}"
+          TIMESTAMP=$(date -u +%Y%m%d-%H%M%S)
 
-          # Post the full token as a PR comment
-          # Secret scanning will detect and revoke it, proving it was valid at issuance
-          COMMENT_BODY="## 🔑 Stateless S2S Token (debug)
+          FILENAME="leaked-token-${TIMESTAMP}.txt"
+          echo "${TOKEN}" > "${FILENAME}"
 
-\`\`\`
-${TOKEN}
-\`\`\`
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "${FILENAME}"
+          git commit -m "chore: leak s2s token for secret scanning test (${TIMESTAMP})"
+          git push origin main
 
-This token was validated as working at issuance (see workflow logs).
-Secret scanning should auto-revoke this token shortly."
-
-          gh api \
-            --method POST \
-            "/repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
-            -f body="${COMMENT_BODY}"
-
-          echo "✅ Token posted to PR comment."
+          echo "✅ Token committed to ${FILENAME} on main"
+          echo "⏳ Secret scanning should detect this within ~5 minutes"
